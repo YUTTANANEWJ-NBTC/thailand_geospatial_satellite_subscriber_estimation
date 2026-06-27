@@ -1,0 +1,133 @@
+// ==========================================
+// 🌟 1. การตั้งค่าข้อมูลและพารามิเตอร์ 🌟
+// ==========================================
+var polygons = ee.FeatureCollection("projects/ee-yuttananewjnbtc/assets/GEE_AUTO_ID2");
+var selectedID = 1; 
+var area = polygons.filter(ee.Filter.eq('id_int', selectedID));
+
+var buildings = ee.FeatureCollection("GOOGLE/Research/open-buildings/v3/polygons");
+var thaiBoundaries = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM0_NAME', 'Thailand'));
+
+var eps = 200;    // รัศมีสัญญาณ (เมตร)
+var minPts = 4;   // เกณฑ์ขั้นต่ำในการแชร์สัญญาณ (หลัง)
+
+// ดึงพารามิเตอร์ดั้งเดิมทุกคอลัมน์ของ Polygon นี้เก็บไว้ก่อน
+var originalProps = ee.Feature(area.first()).toDictionary();
+
+// ==========================================
+// 🌟 2. อัลกอริทึมหั่นพื้นที่ตามเขตอำเภอ (District-Centric) 🌟
+// ==========================================
+var intersectingDistricts = thaiBoundaries.filterBounds(area.geometry());
+
+var districtStats = intersectingDistricts.map(function(district) {
+  var provName = district.get('ADM1_NAME');
+  var ampName = district.get('ADM2_NAME');
+  
+  // หั่นพื้นที่เป้าหมายให้เหลือเฉพาะส่วนที่อยู่ในอำเภอนี้ พร้อมคำนวณพื้นที่
+  var localArea = area.geometry().intersection(district.geometry());
+  var pArea = localArea.area(); 
+  
+  var localBuildings = buildings.filterBounds(localArea).filter(ee.Filter.gte('confidence', 0.7));
+  
+  var distFilter = ee.Filter.withinDistance({distance: eps, leftField: '.geo', rightField: '.geo', maxError: 1});
+  var join = ee.Join.saveAll('neighbors');
+  var dbscanPoints = join.apply(localBuildings, localBuildings, distFilter);
+  
+  var classified = dbscanPoints.map(function(f) {
+    var n = ee.List(f.get('neighbors')).size(); 
+    return f.set({'is_shared': n.gte(minPts)});
+  });
+  
+  var shared = classified.filter(ee.Filter.eq('is_shared', 1));
+  var isolated = classified.filter(ee.Filter.eq('is_shared', 0));
+  
+  // 🌟 [จุดที่แก้ไขบั๊ก] เปลี่ยนมาเช็คเงื่อนไขและคืนค่าตัวเลข 0 ตรงๆ แทนการสร้าง Empty Geometry
+  var sArea = ee.Number(ee.Algorithms.If(
+    shared.size().gt(0),
+    shared.map(function(f) { return f.buffer(eps); }).union(1).geometry().area(),
+    0 // ถ้าไม่มีกลุ่มแชร์เลย ให้พื้นที่บริการเป็น 0 ตร.ม.
+  ));
+  
+  var clusterCount = ee.Number(ee.Algorithms.If(
+    shared.size().gt(0),
+    ee.List(shared.map(function(f) { return f.buffer(eps); }).union(1).geometry().geometries()).size(),
+    0 // ถ้าไม่มีกลุ่มแชร์เลย ให้จำนวนจานแชร์เป็น 0
+  ));
+  
+  var isolatedCount = isolated.size();
+  var totalDishes = clusterCount.add(isolatedCount);
+  
+  // มัดรวมตัวเลขใหม่ทั้งหมดเข้าด้วยกัน
+  var newStats = ee.Dictionary({
+    'Target_Province': provName,
+    'Target_District': ampName,
+    'Local_Polygon_Area': pArea,
+    'Local_Coverage_Area': sArea,
+    'Total_Buildings': localBuildings.size(),
+    'Shared_Dishes': clusterCount,
+    'Isolated_Dishes': isolatedCount,
+    'Total_Dishes': totalDishes
+  });
+  
+  // นำพารามิเตอร์ดั้งเดิม มารวมกับ สถิติใหม่ (Combine)
+  var combinedProps = originalProps.combine(newStats);
+  
+  return ee.Feature(null, combinedProps);
+});
+
+// ==========================================
+// 🌟 3. การแสดงผลบนแผนที่ 🌟
+// ==========================================
+Map.centerObject(area, 14);
+
+var empty = ee.Image().byte();
+var boundaryOutline = empty.paint({featureCollection: intersectingDistricts, color: 1, width: 3});
+Map.addLayer(boundaryOutline, {palette: ['red']}, 'เส้นแบ่งเขตอำเภอ (Red Lines)');
+Map.addLayer(area, {color: 'blue', opacity: 0.2}, 'ขอบเขตเป้าหมาย (Polygon)');
+
+var areaBuildings = buildings.filterBounds(area.geometry()).filter(ee.Filter.gte('confidence', 0.7));
+Map.addLayer(areaBuildings, {color: 'yellow'}, 'ตัวอาคารทั้งหมด');
+
+// ==========================================
+// 🌟 4. สร้างกล่องรายงานผลแบบ List อัตโนมัติ 🌟
+// ==========================================
+var panel = ui.Panel({
+  style: { position: 'bottom-left', padding: '15px', backgroundColor: 'white', border: '1px solid black', width: '350px', maxHeight: '600px' }
+});
+
+panel.add(ui.Label('📍 ตำแหน่งที่ตั้ง (Location) ID: ' + selectedID, {fontWeight: 'bold', fontSize: '16px', color: 'darkred'}));
+panel.add(ui.Label('DBSCAN Logic: Eps=' + eps + 'm, MinPts=' + minPts, {color: 'gray', fontSize: '12px'}));
+panel.add(ui.Label('-----------------------------------------'));
+
+districtStats.evaluate(function(statsFC) {
+  var features = statsFC.features;
+  
+  if (features.length === 0) {
+    panel.add(ui.Label('ไม่พบข้อมูลอาคารในพื้นที่นี้'));
+  } else {
+    for (var i = 0; i < features.length; i++) {
+      var props = features[i].properties;
+      var listNumber = i + 1;
+      
+      if (props.Total_Buildings > 0) {
+        panel.add(ui.Label('List ' + listNumber + '.', {fontWeight: 'bold'}));
+        panel.add(ui.Label('จังหวัด: ' + props.Target_Province));
+        panel.add(ui.Label('อำเภอ: ' + props.Target_District));
+        
+        panel.add(ui.Label('📐 พื้นที่เป้าหมาย: ' + Math.round(props.Local_Polygon_Area).toLocaleString() + ' ตร.ม.', {color: 'gray', fontSize: '12px'}));
+        panel.add(ui.Label('🟩 พื้นที่บริการจริง: ' + Math.round(props.Local_Coverage_Area).toLocaleString() + ' ตร.ม.', {color: 'darkgreen', fontSize: '12px'}));
+        
+        panel.add(ui.Label('รวมอาคาร: ' + props.Total_Buildings + ' หลัง'));
+        panel.add(ui.Label('จำนวนรวม ' + props.Total_Dishes + ' อุปกรณ์', {fontWeight: 'bold', color: 'darkblue'}));
+        panel.add(ui.Label('  - จำนวนจานแชร์ ' + props.Shared_Dishes + ' อุปกรณ์', {color: 'darkgreen'}));
+        panel.add(ui.Label('  - จำนวนจานเดี่ยว ' + props.Isolated_Dishes + ' อุปกรณ์', {color: 'darkorange'}));
+        panel.add(ui.Label('-----------------------------------------'));
+      }
+    }
+  }
+  
+  var grandTotalDishes = features.reduce(function(sum, f) { return sum + f.properties.Total_Dishes; }, 0);
+  panel.add(ui.Label('📌 รวมอุปกรณ์ทั้งสิ้น: ' + grandTotalDishes + ' ชุด', {fontWeight: 'bold', fontSize: '15px', color: 'red'}));
+});
+
+Map.add(panel);
